@@ -36,7 +36,6 @@ include = ["cs336_alignment*"]
 [tool.uv]
 package = true
 environments = [
-    "sys_platform == 'darwin' and platform_machine == 'arm64'",
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
@@ -46,8 +45,8 @@ torch = [
 ]
 [[tool.uv.index]]
 name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = true
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
 
 [tool.pytest.ini_options]
 log_cli = true

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import json
+import random
+import re
 from typing import Any, Callable, Literal
 
 import torch
@@ -46,7 +49,17 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    raise NotImplementedError
+    if len(prompt_strs) != len(output_strs): raise ValueError("length mismatch")
+    seqs=[]; starts=[]; ends=[]
+    for p, o in zip(prompt_strs, output_strs):
+        pt=tokenizer.encode(p, add_special_tokens=True); ot=tokenizer.encode(o, add_special_tokens=False)
+        seqs.append(pt+ot); starts.append(len(pt)); ends.append(len(pt)+len(ot))
+    m=max((len(x) for x in seqs), default=1); pad=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
+    arr=[x+[pad]*(m-len(x)) for x in seqs]
+    input_ids=torch.tensor([x[:-1] for x in arr],dtype=torch.long); labels=torch.tensor([x[1:] for x in arr],dtype=torch.long)
+    mask=torch.zeros_like(labels,dtype=torch.bool)
+    for i,(a,b) in enumerate(zip(starts,ends)): mask[i,max(0,a-1):max(0,b-1)]=True
+    return {"input_ids":input_ids,"labels":labels,"response_mask":mask}
 
 
 def run_get_response_log_probs(
@@ -82,7 +95,10 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    raise NotImplementedError
+    logits=model(input_ids=input_ids).logits; lp=torch.log_softmax(logits,dim=-1)
+    out={"log_probs":lp.gather(-1,labels.unsqueeze(-1)).squeeze(-1)}
+    if return_token_entropy: out["token_entropy"]=-(lp.exp()*lp).sum(-1)
+    return out
 
 
 def run_compute_rollout_rewards(
@@ -114,7 +130,9 @@ def run_compute_rollout_rewards(
                 Reward statistics to log. At minimum, include the mean total
                 and format rewards over the rollout batch.
     """
-    raise NotImplementedError
+    scores=[reward_fn(r,g) for r,g in zip(rollout_responses,repeated_ground_truths)]
+    rewards=torch.tensor([float(x["reward"]) for x in scores],dtype=torch.float32); n=max(1,len(scores))
+    return rewards,{"reward_mean":float(rewards.mean()) if len(rewards) else 0.0,"format_reward_mean":sum(float(x.get("format_reward",0)) for x in scores)/n,"answer_reward_mean":sum(float(x.get("answer_reward",0)) for x in scores)/n}
 
 
 def run_compute_group_normalized_rewards(
@@ -153,7 +171,15 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    if group_size<=0 or raw_rewards.numel()%group_size: raise ValueError("invalid group_size")
+    g=raw_rewards.reshape(-1,group_size)
+    if baseline=="mean": a=g-g.mean(1,keepdim=True)
+    elif baseline=="none": a=g.clone()
+    else: raise ValueError("invalid baseline")
+    if advantage_normalizer=="std": a=a/(g.std(1,keepdim=True,unbiased=True)+advantage_eps)
+    elif advantage_normalizer=="mean": a=a/(g.mean(1,keepdim=True)+advantage_eps)
+    elif advantage_normalizer!="none": raise ValueError("invalid normalizer")
+    return a.reshape(-1),{"raw_reward_mean":float(raw_rewards.mean()),"advantage_mean":float(a.mean())}
 
 
 def run_compute_policy_gradient_loss(
@@ -200,7 +226,20 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    raise NotImplementedError
+    a=raw_rewards_or_advantages.reshape(-1,1).to(policy_log_probs); meta={}
+    if importance_reweighting_method=="none": loss=-a*policy_log_probs
+    else:
+        if old_log_probs is None: raise ValueError("old_log_probs required")
+        lr=policy_log_probs-old_log_probs
+        if importance_reweighting_method=="noclip": loss=-a*torch.exp(lr)
+        elif importance_reweighting_method=="grpo":
+            if cliprange is None: raise ValueError("cliprange required")
+            r=torch.exp(lr); c=r.clamp(1-cliprange,1+cliprange); loss=-torch.minimum(r*a,c*a)
+        elif importance_reweighting_method=="gspo":
+            if cliprange is None or response_mask is None: raise ValueError("GSPO args required")
+            m=response_mask.to(lr); r=torch.exp((lr*m).sum(1,keepdim=True)/m.sum(1,keepdim=True).clamp_min(1)); c=r.clamp(1-cliprange,1+cliprange); loss=-torch.minimum(r*a,c*a).expand_as(policy_log_probs)
+        else: raise ValueError("invalid importance method")
+    return loss,meta
 
 
 def run_aggregate_loss_across_microbatch(
@@ -232,7 +271,12 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    raise NotImplementedError
+    x=per_token_policy_gradient_loss*mask.to(per_token_policy_gradient_loss)
+    if loss_normalization=="sequence": return (x.sum(1)/mask.sum(1).clamp_min(1)).mean()
+    if loss_normalization=="constant":
+        if normalization_constant is None: raise ValueError("normalization_constant required")
+        return x.sum()/normalization_constant
+    raise ValueError("invalid normalization")
 
 
 def run_grpo_train_step(
@@ -321,7 +365,17 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    raise NotImplementedError
+    t=run_tokenize_prompt_and_output(repeated_prompts,rollout_responses,tokenizer); r,rm=run_compute_rollout_rewards(reward_fn,rollout_responses,repeated_ground_truths); a,am=run_compute_group_normalized_rewards(r,group_size,baseline,advantage_eps,advantage_normalizer)
+    n=len(repeated_prompts)
+    if n%gradient_accumulation_steps: raise ValueError("batch not divisible")
+    ms=n//gradient_accumulation_steps; optimizer.zero_grad(set_to_none=True); losses=[]
+    for st in range(0,n,ms):
+        sl=slice(st,st+ms); lp=run_get_response_log_probs(model,t["input_ids"][sl],t["labels"][sl],False)["log_probs"]; old=old_log_probs[sl] if old_log_probs is not None else None
+        pg,_=run_compute_policy_gradient_loss(a[sl],lp,importance_reweighting_method,old,cliprange,t["response_mask"][sl]); loss=run_aggregate_loss_across_microbatch(pg,t["response_mask"][sl],loss_normalization,normalization_constant); losses.append(loss.detach()); (loss if loss_normalization=="constant" else loss/gradient_accumulation_steps).backward()
+    gn=torch.nn.utils.clip_grad_norm_(model.parameters(),max_grad_norm) if max_grad_norm is not None else None; optimizer.step(); optimizer.zero_grad(set_to_none=True)
+    md={**rm,**am};
+    if gn is not None: md["grad_norm"]=gn.detach()
+    return (torch.stack(losses).sum() if loss_normalization=="constant" else torch.stack(losses).mean()),md
 
 
 """
@@ -357,7 +411,16 @@ def get_packed_sft_dataset(
         "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
         the token IDs for the language modeling labels.
     """
-    raise NotImplementedError
+    with open(dataset_path) as f: records=[json.loads(x) for x in f if x.strip()]
+    if shuffle: random.shuffle(records)
+    ids=[]
+    for z in records:
+        text="Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n"+z["prompt"]+"\n\n### Response:\n"+z["response"]; ids.extend(tokenizer.encode(text,add_special_tokens=True)); ids.append(tokenizer.eos_token_id)
+    items=[{"input_ids":torch.tensor(ids[i:i+seq_length],dtype=torch.long),"labels":torch.tensor(ids[i+1:i+seq_length+1],dtype=torch.long)} for i in range(0,len(ids)-seq_length,seq_length)]
+    class Packed(Dataset):
+        def __len__(self): return len(items)
+        def __getitem__(self,i): return items[i]
+    return Packed()
 
 
 def run_iterate_batches(
@@ -380,7 +443,12 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+    ix=list(range(len(dataset))); random.shuffle(ix) if shuffle else None
+    batches=[{k:torch.stack([dataset[i][k] for i in ix[s:s+batch_size]]) for k in dataset[ix[s]]} for s in range(0,len(ix),batch_size)]
+    class Batches:
+        def __len__(self): return len(batches)
+        def __iter__(self): return iter(batches)
+    return Batches()
 
 
 def run_parse_mmlu_response(
@@ -406,7 +474,11 @@ def run_parse_mmlu_response(
         str (one of "A", "B", "C", or "D") if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    found=re.findall(r"(?:answer|option|choice)\s*(?:is|:)?\s*\(?([A-D])\)?\b",model_output,re.I)
+    if found: return found[-1].upper()
+    for i,o in enumerate(mmlu_example.get("options",[])[:4]):
+        if o and re.search(r"(?<!\w)" + re.escape(o.lower()) + r"(?!\w)", model_output.lower()): return "ABCD"[i]
+    return None
 
 
 def run_parse_gsm8k_response(
@@ -423,7 +495,7 @@ def run_parse_gsm8k_response(
         str with the predicted numeric answer if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    x=re.findall(r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?",model_output); return x[-1].replace(",","") if x else None
 
 
 def run_compute_per_instance_dpo_loss(
@@ -458,4 +530,10 @@ def run_compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+    def score(model,response):
+        ids=torch.tensor([tokenizer.encode(prompt,add_special_tokens=True)+tokenizer.encode(response,add_special_tokens=False)])
+        plen=len(tokenizer.encode(prompt,add_special_tokens=True)); lp=torch.log_softmax(model(input_ids=ids).logits[:,:-1],-1).gather(-1,ids[:,1:].unsqueeze(-1)).squeeze(-1)
+        return lp[:,plen-1:].sum(1) / max(1, len(tokenizer.encode(response,add_special_tokens=False)))
+    pc,pr=score(lm,response_chosen),score(lm,response_rejected)
+    with torch.no_grad(): rc,rr=score(lm_ref,response_chosen),score(lm_ref,response_rejected)
+    return -torch.nn.functional.logsigmoid(2.083*beta*((pc-pr)-(rc-rr))).mean()
